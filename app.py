@@ -2,15 +2,82 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import pytz
+import re
+import io
 
-# ================= 核心业务逻辑 =================
+# ================= 数据解析与清洗层 =================
 
-def standardize_data(df: pd.DataFrame, data_tz: str, stats_tz: str) -> pd.DataFrame:
+def detect_and_parse_csv(uploaded_file):
     """
-    清洗并标准化数据，包含时区转换处理。
+    自动识别 CSV 格式并提取标准化的 DataFrame。
+    返回: (df_clean, has_time)
     """
-    # 1. 基础映射清洗
+    # 读取为字符串列表进行分析
+    content = uploaded_file.getvalue().decode("utf-8", errors='ignore')
+    lines = content.splitlines()
+    
+    if not lines:
+        raise ValueError("上传的文件为空 / The uploaded file is empty.")
+
+    # 嗅探格式：如果第一行包含 "Statement" 或 "Transaction History"
+    is_ibkr_format = "Statement" in lines[0] or "Transaction History" in lines[0] or "总结" in lines[0]
+
+    if is_ibkr_format:
+        return _parse_ibkr_format(lines)
+    else:
+        return _parse_standard_format(uploaded_file)
+
+def _parse_ibkr_format(lines):
+    """
+    解析 IBKR (盈透) Statement 格式 (仅日期，无时间)
+    """
+    trade_data = []
+    for line in lines:
+        if line.startswith("Transaction History,Data,"):
+            parts = line.split(",")
+            # 标准列索引 (基于提供的样本):
+            # [2]日期, [5]交易类型(买/卖), [6]代码, [7]数量, [8]价格, [10]总额(含括号), [11]佣金
+            
+            # 清理金额字段中的特殊字符如 "-342962.5(1)" -> 342962.5
+            raw_amt = parts[10]
+            amt_cleaned = re.sub(r'[^\d.-]', '', raw_amt)
+            
+            trade_data.append({
+                'Symbol': parts[6].strip(),
+                'Side': parts[5].strip(),
+                'Qty': abs(float(parts[7])), # 取绝对值
+                'Price': float(parts[8]),
+                'Time': pd.to_datetime(parts[2].strip()), # 只有日期，时间默认为 00:00:00
+                'Net_Amount': abs(float(amt_cleaned)),
+                'Commission': abs(float(parts[11]))
+            })
+            
+    df = pd.DataFrame(trade_data)
+    
+    if df.empty:
+        raise ValueError("未在该格式中找到任何交易记录 / No trades found in this statement.")
+        
+    # 【关键处理】IBKR 的报表默认是自下而上（最新记录在最前）。
+    # 因为没有时分秒，必须把整个列表彻底倒序，才能恢复真实的先后发生顺序。
+    df = df.iloc[::-1].reset_index(drop=True)
+    
+    # 映射买卖方向
+    side_mapping = {'买': 'Buy', '卖': 'Sell', 'Buy': 'Buy', 'Sell': 'Sell'}
+    df['Side'] = df['Side'].str.title().map(side_mapping).fillna(df['Side'])
+    
+    # 因为已经物理倒序，这里使用 stable (mergesort) 保留同一天内的原始先后顺序
+    df = df.sort_values(by='Time', kind='mergesort').reset_index(drop=True)
+    
+    return df, False  # False 表示没有具体时间
+
+def _parse_standard_format(uploaded_file):
+    """
+    解析标准扁平表格格式 (包含具体时间)
+    """
+    uploaded_file.seek(0)
+    df = pd.read_csv(uploaded_file)
     df.rename(columns=lambda x: str(x).strip(), inplace=True)
+    
     col_mapping = {
         '商品代码': 'Symbol', '买/卖': 'Side', '数量': 'Qty',
         '执行价': 'Price', 'Fill Price': 'Price', '时间': 'Time',
@@ -26,23 +93,25 @@ def standardize_data(df: pd.DataFrame, data_tz: str, stats_tz: str) -> pd.DataFr
     side_mapping = {'买入': 'Buy', '卖出': 'Sell', 'Buy': 'Buy', 'Sell': 'Sell'}
     df['Side'] = df['Side'].str.strip().str.title().map(side_mapping).fillna(df['Side'])
     
-    # 2. 时区处理核心逻辑
     df['Time'] = pd.to_datetime(df['Time'])
     
-    # 如果原始时间数据没有时区信息 (Naive)，先赋予其【数据原时区】
+    # 按时间正序排列
+    df = df.sort_values(by='Time').reset_index(drop=True)
+    
+    return df, True  # True 表示含有具体时间
+
+def apply_timezone_if_needed(df, data_tz, stats_tz):
+    """处理时区转换逻辑"""
     if df['Time'].dt.tz is None:
         df['Time'] = df['Time'].dt.tz_localize(data_tz)
     else:
-        # 如果原始数据已经自带时区，则转换到【数据原时区】统一基准
         df['Time'] = df['Time'].dt.tz_convert(data_tz)
         
-    # 将时间统一转换为【统计分割时区】
     df['Time'] = df['Time'].dt.tz_convert(stats_tz)
-    
-    # 3. 按统计时区的时间排序
-    df = df.sort_values(by='Time').reset_index(drop=True)
-    
+    df = df.sort_values(by='Time', kind='mergesort').reset_index(drop=True)
     return df
+
+# ================= 业务计算层 (FIFO & Stats) =================
 
 def get_multiplier(df: pd.DataFrame) -> float:
     """计算合约乘数"""
@@ -87,7 +156,7 @@ def calculate_fifo(df: pd.DataFrame) -> pd.DataFrame:
                 trades.append({
                     'Symbol': sym,
                     'Open_Time': match['time'],
-                    'Close_Time': time, # 此时的 time 已经是【统计时区】下的时间了
+                    'Close_Time': time,
                     'Close_Side': side,
                     'Qty': match_qty,
                     'Buy_Price': buy_price,
@@ -107,10 +176,8 @@ def calculate_fifo(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_daily_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     """按日计算统计指标"""
-    if trades_df.empty:
-        return pd.DataFrame()
+    if trades_df.empty: return pd.DataFrame()
 
-    # 因为 Close_Time 已经被转成了【统计时区】，这里的 date 就是该时区下正确的“一天”
     trades_df['Date'] = trades_df['Close_Time'].dt.date
     daily_stats = []
 
@@ -141,58 +208,49 @@ def compute_daily_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
         
     return pd.DataFrame(daily_stats)
 
-# ================= UI 渲染逻辑 =================
+# ================= UI 渲染层 =================
 
 st.set_page_config(page_title="Trade Analyzer | 交易记录分析", layout="wide")
 
-# 侧边栏设置
-st.sidebar.header("⚙️ 时区设置 / Timezone Settings")
-
-# 预设常用的时区映射
-TIMEZONE_OPTIONS = {
-    "Asia/Shanghai (UTC+8 北京/亚洲)": "Asia/Shanghai",
-    "America/New_York (EST/EDT 美东)": "America/New_York",
-    "America/Chicago (CST/CDT 美中)": "America/Chicago",
-    "America/Los_Angeles (PST/PDT 美西)": "America/Los_Angeles",
-    "UTC (协调世界时)": "UTC",
-    "Europe/London (GMT/BST 英国)": "Europe/London"
-}
-
-data_tz_key = st.sidebar.selectbox(
-    "1. 数据源时区 / Data Timezone\n(CSV 文件中的时间属于哪个时区？)", 
-    list(TIMEZONE_OPTIONS.keys()), 
-    index=0 # 默认 "Asia/Shanghai"
-)
-
-stats_tz_key = st.sidebar.selectbox(
-    "2. 统计分割时区 / Stats Timezone\n(你想以哪个时区的 00:00 作为一天？)", 
-    list(TIMEZONE_OPTIONS.keys()), 
-    index=1 # 默认 "America/New_York"
-)
-
-data_tz = TIMEZONE_OPTIONS[data_tz_key]
-stats_tz = TIMEZONE_OPTIONS[stats_tz_key]
-
-st.sidebar.divider()
-st.sidebar.markdown(f"**当前转换逻辑:**\n- 原始数据被视为: `{data_tz}`\n- 按日统计按照: `{stats_tz}` 分割")
-
-# 主界面
 st.title("📈 交易记录分析器")
-st.markdown("上传 CSV 文件（支持中/英文表头），系统将自动使用 **先进先出 (FIFO)** 原则匹配闭合交易，并生成每日数据报告。")
+st.markdown("支持 **tradingview导出的IBKR交易历史记录CSV** 与 **IBKR网页上导出的交易历史CSV格式**。")
 
 uploaded_file = st.file_uploader("拖拽或点击上传 CSV 文件 / Drag and drop CSV here", type=['csv'])
 
 if uploaded_file:
     try:
-        # 1. 加载与清洗 (带入时区参数)
-        df_raw = pd.read_csv(uploaded_file)
-        df_clean = standardize_data(df_raw, data_tz, stats_tz)
+        # 1. 解析数据，并感知格式
+        df_clean, has_time = detect_and_parse_csv(uploaded_file)
+        
+        # 2. 时区面板逻辑：只有在包含时分秒的格式下才显示，如果只有日期则跳过
+        if has_time:
+            st.sidebar.header("⚙️ 时区设置 / Timezone Settings")
+            TIMEZONE_OPTIONS = {
+                "Asia/Shanghai (UTC+8 北京/亚洲)": "Asia/Shanghai",
+                "America/New_York (EST/EDT 美东)": "America/New_York",
+                "America/Chicago (CST/CDT 美中)": "America/Chicago",
+                "America/Los_Angeles (PST/PDT 美西)": "America/Los_Angeles",
+                "UTC (协调世界时)": "UTC",
+                "Europe/London (GMT/BST 英国)": "Europe/London"
+            }
+            data_tz_key = st.sidebar.selectbox("1. 数据源时区 (Data Timezone)", list(TIMEZONE_OPTIONS.keys()), index=0)
+            stats_tz_key = st.sidebar.selectbox("2. 统计分割时区 (Stats Timezone)", list(TIMEZONE_OPTIONS.keys()), index=1)
+            
+            # 应用时区转换
+            df_clean = apply_timezone_if_needed(df_clean, TIMEZONE_OPTIONS[data_tz_key], TIMEZONE_OPTIONS[stats_tz_key])
+            st.sidebar.success("已启用时区转换。")
+        else:
+            st.sidebar.info("💡 格式感知：\n检测到该 CSV 为**仅包含日期的报表格式** (如 IBKR Statement)。已自动跳过时区转换环节。")
 
-        with st.expander("预览解析后的源数据 (已转换至统计时区) / Raw Data in Stats Timezone"):
-            st.dataframe(df_clean.head(10))
+        # 3. 运行 FIFO 及数据展示
+        with st.expander("预览底层标准化后的源数据 / Raw Data Standardized"):
+            # 根据是否带时间，灵活格式化展示
+            display_df = df_clean.copy()
+            time_format = '%Y-%m-%d %H:%M:%S' if has_time else '%Y-%m-%d'
+            display_df['Time'] = display_df['Time'].dt.strftime(time_format)
+            st.dataframe(display_df.head(10))
 
         with st.spinner('正在运行 FIFO 撮合引擎... / Running FIFO Engine...'):
-            # 2. 计算 FIFO 与日统计
             trades_df = calculate_fifo(df_clean)
             
             if trades_df.empty:
@@ -201,14 +259,12 @@ if uploaded_file:
                 
             daily_df = compute_daily_stats(trades_df)
 
-            # 3. 渲染顶栏指标
             st.subheader("📊 整体表现 / Overall Performance")
             metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
             
             total_net = trades_df['Net_Profit'].sum()
             total_trades = len(trades_df)
             overall_win_rate = len(trades_df[trades_df['Net_Profit'] > 0]) / total_trades * 100
-            
             gross_p = trades_df[trades_df['Net_Profit'] > 0]['Net_Profit'].sum()
             gross_l = abs(trades_df[trades_df['Net_Profit'] <= 0]['Net_Profit'].sum())
             overall_pf = gross_p / gross_l if gross_l > 0 else float('inf')
@@ -216,17 +272,13 @@ if uploaded_file:
             metrics_col1.metric("总净利润 / Total Net Profit", f"{total_net:,.2f}")
             metrics_col2.metric("交易笔数 / Total Trades", total_trades)
             metrics_col3.metric("整体胜率 / Win Rate", f"{overall_win_rate:.1f}%")
-            metrics_col4.metric("整体盈利因子 / Profit Factor", 
-                                f"{overall_pf:.2f}" if overall_pf != float('inf') else "∞")
+            metrics_col4.metric("整体盈利因子 / Profit Factor", f"{overall_pf:.2f}" if overall_pf != float('inf') else "∞")
 
             st.divider()
 
-            # 4. 图表与报表
-            st.subheader(f"📅 每日统计 / Daily Report (Timezone: {stats_tz})")
-            
+            st.subheader(f"📅 每日统计 / Daily Report")
             styled_daily_df = daily_df.style.format({
-                'Net Profit': "{:,.2f}",
-                'Win Rate (%)': "{:.2f}%",
+                'Net Profit': "{:,.2f}", 'Win Rate (%)': "{:.2f}%",
                 'Profit Factor': lambda x: "∞" if x == float('inf') else f"{x:.2f}",
                 'Avg PnL Ratio': lambda x: "∞" if x == float('inf') else f"{x:.2f}",
             })
@@ -235,23 +287,18 @@ if uploaded_file:
             st.subheader("📈 每日净利走势 / Daily Net Profit Chart")
             st.bar_chart(daily_df.set_index('Date')['Net Profit'])
 
-            # 5. FIFO 明细账
             with st.expander("🔍 查看 FIFO 匹配明细 / View FIFO Matched Trades"):
-                # 转换 datetime 列的格式，以便在 Streamlit 中更优雅地展示
                 display_trades = trades_df.copy()
-                display_trades['Open_Time'] = display_trades['Open_Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-                display_trades['Close_Time'] = display_trades['Close_Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                display_trades['Open_Time'] = display_trades['Open_Time'].dt.strftime(time_format)
+                display_trades['Close_Time'] = display_trades['Close_Time'].dt.strftime(time_format)
 
                 styled_trades_df = display_trades.style.format({
-                    'Buy_Price': "{:.2f}",
-                    'Sell_Price': "{:.2f}",
-                    'Gross_PnL': "{:.2f}",
-                    'Commission': "{:.2f}",
-                    'Net_Profit': "{:.2f}",
+                    'Buy_Price': "{:.2f}", 'Sell_Price': "{:.2f}",
+                    'Gross_PnL': "{:.2f}", 'Commission': "{:.2f}", 'Net_Profit': "{:.2f}",
                 })
                 st.dataframe(styled_trades_df, use_container_width=True)
 
     except ValueError as ve:
-        st.error(f"数据格式错误: {ve}")
+        st.error(f"解析出错: {ve}")
     except Exception as e:
         st.error(f"处理数据时发生未知错误 / An error occurred: {e}")
