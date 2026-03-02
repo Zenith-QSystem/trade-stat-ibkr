@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import pytz
 import re
-import io
 
 # ================= 数据解析与清洗层 =================
 
@@ -12,15 +11,14 @@ def detect_and_parse_csv(uploaded_file):
     自动识别 CSV 格式并提取标准化的 DataFrame。
     返回: (df_clean, has_time)
     """
-    # 读取为字符串列表进行分析
     content = uploaded_file.getvalue().decode("utf-8", errors='ignore')
     lines = content.splitlines()
     
     if not lines:
         raise ValueError("上传的文件为空 / The uploaded file is empty.")
 
-    # 嗅探格式：如果第一行包含 "Statement" 或 "Transaction History"
-    is_ibkr_format = "Statement" in lines[0] or "Transaction History" in lines[0] or "总结" in lines[0]
+    # 嗅探格式：如果第一行包含 "Statement" 或 "Transaction History" 或 "总结"
+    is_ibkr_format = any(keyword in lines[0] for keyword in ["Statement", "Transaction History", "总结"])
 
     if is_ibkr_format:
         return _parse_ibkr_format(lines)
@@ -35,37 +33,55 @@ def _parse_ibkr_format(lines):
     for line in lines:
         if line.startswith("Transaction History,Data,"):
             parts = line.split(",")
-            # 标准列索引 (基于提供的样本):
-            # [2]日期, [5]交易类型(买/卖), [6]代码, [7]数量, [8]价格, [10]总额(含括号), [11]佣金
+            
+            # 保护性检查，防止某些行缺失列
+            if len(parts) < 12:
+                continue
+            
+            side_raw = parts[5].strip()
+            qty_raw = parts[7].strip()
+            price_raw = parts[8].strip()
+            
+            # 【新增过滤逻辑】：过滤掉存款、取款、系统转账等非交易行为
+            # 它们的数量(Qty)或价格(Price)通常是 '-'
+            if qty_raw == '-' or price_raw == '-':
+                continue
+                
+            # 进一步保障，只有包含以下关键字的才被认作有效交易
+            if side_raw not in ['买', '卖', 'Buy', 'Sell', '买入', '卖出']:
+                continue
             
             # 清理金额字段中的特殊字符如 "-342962.5(1)" -> 342962.5
             raw_amt = parts[10]
             amt_cleaned = re.sub(r'[^\d.-]', '', raw_amt)
             
+            # 清理佣金字段 (有些免佣或者其他记录可能为 '-')
+            comm_raw = parts[11].strip()
+            comm_val = 0.0 if comm_raw == '-' else abs(float(comm_raw))
+            
             trade_data.append({
                 'Symbol': parts[6].strip(),
-                'Side': parts[5].strip(),
-                'Qty': abs(float(parts[7])), # 取绝对值
-                'Price': float(parts[8]),
-                'Time': pd.to_datetime(parts[2].strip()), # 只有日期，时间默认为 00:00:00
+                'Side': side_raw,
+                'Qty': abs(float(qty_raw)),
+                'Price': float(price_raw),
+                'Time': pd.to_datetime(parts[2].strip()), # 只有日期
                 'Net_Amount': abs(float(amt_cleaned)),
-                'Commission': abs(float(parts[11]))
+                'Commission': comm_val
             })
             
     df = pd.DataFrame(trade_data)
     
     if df.empty:
-        raise ValueError("未在该格式中找到任何交易记录 / No trades found in this statement.")
+        raise ValueError("未在文件中提取到任何有效的期货交易明细，可能是仅包含出入金记录。")
         
     # 【关键处理】IBKR 的报表默认是自下而上（最新记录在最前）。
-    # 因为没有时分秒，必须把整个列表彻底倒序，才能恢复真实的先后发生顺序。
+    # 彻底倒序，恢复真实的先后发生顺序。
     df = df.iloc[::-1].reset_index(drop=True)
     
-    # 映射买卖方向
-    side_mapping = {'买': 'Buy', '卖': 'Sell', 'Buy': 'Buy', 'Sell': 'Sell'}
+    side_mapping = {'买': 'Buy', '卖': 'Sell', 'Buy': 'Buy', 'Sell': 'Sell', '买入': 'Buy', '卖出': 'Sell'}
     df['Side'] = df['Side'].str.title().map(side_mapping).fillna(df['Side'])
     
-    # 因为已经物理倒序，这里使用 stable (mergesort) 保留同一天内的原始先后顺序
+    # 物理倒序后，使用 stable (mergesort) 保留同一天内的原始先后顺序
     df = df.sort_values(by='Time', kind='mergesort').reset_index(drop=True)
     
     return df, False  # False 表示没有具体时间
@@ -92,13 +108,10 @@ def _parse_standard_format(uploaded_file):
     
     side_mapping = {'买入': 'Buy', '卖出': 'Sell', 'Buy': 'Buy', 'Sell': 'Sell'}
     df['Side'] = df['Side'].str.strip().str.title().map(side_mapping).fillna(df['Side'])
-    
     df['Time'] = pd.to_datetime(df['Time'])
     
-    # 按时间正序排列
     df = df.sort_values(by='Time').reset_index(drop=True)
-    
-    return df, True  # True 表示含有具体时间
+    return df, True
 
 def apply_timezone_if_needed(df, data_tz, stats_tz):
     """处理时区转换逻辑"""
@@ -222,7 +235,7 @@ if uploaded_file:
         # 1. 解析数据，并感知格式
         df_clean, has_time = detect_and_parse_csv(uploaded_file)
         
-        # 2. 时区面板逻辑：只有在包含时分秒的格式下才显示，如果只有日期则跳过
+        # 2. 时区面板逻辑
         if has_time:
             st.sidebar.header("⚙️ 时区设置 / Timezone Settings")
             TIMEZONE_OPTIONS = {
@@ -236,15 +249,13 @@ if uploaded_file:
             data_tz_key = st.sidebar.selectbox("1. 数据源时区 (Data Timezone)", list(TIMEZONE_OPTIONS.keys()), index=0)
             stats_tz_key = st.sidebar.selectbox("2. 统计分割时区 (Stats Timezone)", list(TIMEZONE_OPTIONS.keys()), index=1)
             
-            # 应用时区转换
             df_clean = apply_timezone_if_needed(df_clean, TIMEZONE_OPTIONS[data_tz_key], TIMEZONE_OPTIONS[stats_tz_key])
             st.sidebar.success("已启用时区转换。")
         else:
-            st.sidebar.info("💡 格式感知：\n检测到该 CSV 为**仅包含日期的报表格式** (如 IBKR Statement)。已自动跳过时区转换环节。")
+            st.sidebar.info("💡 格式感知：\n检测到该 CSV 为**报表格式** (包含出入金自动过滤，无具体时分秒)。已自动跳过时区转换环节。")
 
         # 3. 运行 FIFO 及数据展示
-        with st.expander("预览底层标准化后的源数据 / Raw Data Standardized"):
-            # 根据是否带时间，灵活格式化展示
+        with st.expander("预览底层标准化后的源数据 (已过滤非交易行) / Cleaned Raw Data"):
             display_df = df_clean.copy()
             time_format = '%Y-%m-%d %H:%M:%S' if has_time else '%Y-%m-%d'
             display_df['Time'] = display_df['Time'].dt.strftime(time_format)
@@ -299,6 +310,6 @@ if uploaded_file:
                 st.dataframe(styled_trades_df, use_container_width=True)
 
     except ValueError as ve:
-        st.error(f"解析出错: {ve}")
+        st.error(f"处理错误: {ve}")
     except Exception as e:
-        st.error(f"处理数据时发生未知错误 / An error occurred: {e}")
+        st.error(f"发生未知异常 / An error occurred: {e}")
