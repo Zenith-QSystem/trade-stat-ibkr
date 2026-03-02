@@ -288,12 +288,53 @@ if uploaded_file:
             st.divider()
 
             st.subheader(f"📅 每日统计 / Daily Report")
+            st.markdown("💡 **提示**：点击表格左侧的复选框**选中多行**，下方将自动计算所选日期的合计表现。")
+            
             styled_daily_df = daily_df.style.format({
                 'Net Profit': "{:,.2f}", 'Win Rate (%)': "{:.2f}%",
                 'Profit Factor': lambda x: "∞" if x == float('inf') else f"{x:.2f}",
                 'Avg PnL Ratio': lambda x: "∞" if x == float('inf') else f"{x:.2f}",
             })
-            st.dataframe(styled_daily_df, use_container_width=True)
+            
+            # 【核心修改】启用多行选中功能，并监听选中事件
+            selection_event = st.dataframe(
+                styled_daily_df, 
+                use_container_width=True,
+                on_select="rerun",           # 当选中状态改变时重新运行脚本
+                selection_mode="multi-row"   # 允许选择多行
+            )
+
+            # 获取选中的行索引
+            selected_rows = selection_event.selection.rows
+            
+            # 如果用户选中了行，则计算并展示选中日期的统计数据
+            if selected_rows:
+                st.markdown("### 🎯 所选日期合计表现 / Selected Days Performance")
+                # 提取选中的日期
+                selected_dates = daily_df.iloc[selected_rows]['Date'].tolist()
+                
+                # 从底层 trades_df 中过滤出这些日期的所有交易记录
+                # 这样做是为了最精确地计算胜率和盈亏因子，而不是简单平均每日数据
+                selected_trades = trades_df[trades_df['Date'].isin(selected_dates)]
+                
+                sel_total_net = selected_trades['Net_Profit'].sum()
+                sel_total_trades = len(selected_trades)
+                
+                sel_wins = len(selected_trades[selected_trades['Net_Profit'] > 0])
+                sel_win_rate = (sel_wins / sel_total_trades * 100) if sel_total_trades > 0 else 0
+                
+                sel_gross_p = selected_trades[selected_trades['Net_Profit'] > 0]['Net_Profit'].sum()
+                sel_gross_l = abs(selected_trades[selected_trades['Net_Profit'] <= 0]['Net_Profit'].sum())
+                sel_pf = (sel_gross_p / sel_gross_l) if sel_gross_l > 0 else (float('inf') if sel_gross_p > 0 else 0)
+
+                # 展示选中行的统计面板
+                sel_col1, sel_col2, sel_col3, sel_col4 = st.columns(4)
+                sel_col1.metric("选中净利润", f"{sel_total_net:,.2f}")
+                sel_col2.metric("选中交易笔数", sel_total_trades)
+                sel_col3.metric("选中胜率", f"{sel_win_rate:.1f}%")
+                sel_col4.metric("选中盈利因子", f"{sel_pf:.2f}" if sel_pf != float('inf') else "∞")
+                
+                st.divider()
 
             st.subheader("📈 每日净利走势 / Daily Net Profit Chart")
             st.bar_chart(daily_df.set_index('Date')['Net Profit'])
